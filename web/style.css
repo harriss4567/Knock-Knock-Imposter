@@ -1,0 +1,169 @@
+:root {
+  --wall: #0b0907;
+  --wood-dark: #1d130c;
+  --wood: #2b1d12;
+  --wood-light: #3a2817;
+  --brass: #8a6a35;
+  --brass-light: #c9a25a;
+  --heat: #ff7a1a;
+  --text: #cbbfa6;
+  --text-dim: #7d7260;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--wall);
+  color: var(--text);
+  font-family: "Special Elite", "Courier New", monospace;
+  overflow: hidden;
+}
+
+.room {
+  position: relative;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background:
+    radial-gradient(ellipse at 50% 35%, rgba(60, 42, 24, 0.35), transparent 60%),
+    var(--wall);
+}
+
+/* The door fills most of the height; the peephole sits at eye level. */
+.door {
+  position: relative;
+  height: min(92vh, 900px);
+  width: min(calc(min(92vh, 900px) * 0.48), 92vw);
+  border-radius: 4px;
+  background:
+    repeating-linear-gradient(90deg, rgba(0,0,0,0.18) 0 2px, transparent 2px 9px),
+    repeating-linear-gradient(90deg, rgba(255,220,170,0.03) 0 1px, transparent 1px 23px),
+    linear-gradient(90deg, var(--wood-dark), var(--wood) 20%, var(--wood-light) 50%, var(--wood) 80%, var(--wood-dark));
+  box-shadow:
+    inset 0 0 80px rgba(0,0,0,0.85),
+    0 0 0 10px #120c07,
+    0 30px 80px rgba(0,0,0,0.9);
+}
+
+.panel {
+  position: absolute;
+  left: 12%;
+  right: 12%;
+  border-radius: 3px;
+  box-shadow: inset 2px 2px 0 rgba(0,0,0,0.5), inset -2px -2px 0 rgba(255,220,170,0.05);
+}
+.panel-top { top: 6%; height: 38%; }
+.panel-bottom { top: 52%; bottom: 6%; }
+
+.peephole {
+  position: absolute;
+  left: 50%;
+  top: 25%;
+  width: min(78%, 52vh);
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  padding: 3.5%;
+  background: radial-gradient(circle at 35% 30%, var(--brass-light), var(--brass) 45%, #3d2c12 100%);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.8), inset 0 0 6px rgba(0,0,0,0.7);
+}
+
+.peephole canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  background: #000;
+  box-shadow: inset 0 0 30px #000;
+}
+
+.handle {
+  position: absolute;
+  right: 8%;
+  top: 55%;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, var(--brass-light), var(--brass) 60%, #2a1e0c);
+  box-shadow: 0 3px 8px rgba(0,0,0,0.9);
+}
+
+/* Light from the burning world leaking under the door. */
+.heat {
+  position: absolute;
+  bottom: calc((100vh - min(92vh, 900px)) / 2 - 6px);
+  width: min(calc(min(92vh, 900px) * 0.48), 92vw);
+  height: 6px;
+  background: var(--heat);
+  filter: blur(6px);
+  opacity: 0.55;
+  animation: heat 3.7s ease-in-out infinite alternate;
+  pointer-events: none;
+}
+@keyframes heat { from { opacity: 0.35; } to { opacity: 0.65; } }
+
+.status {
+  position: absolute;
+  top: 2vh;
+  left: 16px;
+  right: 16px;
+  margin: 0;
+  text-align: center;
+  font-size: 1.1rem;
+  letter-spacing: 0.04em;
+  color: var(--text);
+  text-shadow: 0 0 8px #000;
+  min-height: 1.4em;
+}
+
+.controls {
+  position: absolute;
+  bottom: 3vh;
+  display: flex;
+  gap: 12px;
+}
+
+button {
+  font: inherit;
+  font-size: 1rem;
+  color: var(--text);
+  background: rgba(20, 14, 9, 0.85);
+  border: 1px solid #4a3a26;
+  padding: 10px 18px;
+  cursor: pointer;
+  letter-spacing: 0.05em;
+}
+button:hover { border-color: var(--brass-light); color: #efe2c4; }
+button:focus-visible { outline: 2px solid var(--brass-light); outline-offset: 2px; }
+
+.hidden { display: none !important; }
+
+/* The avatar's raw video: drawn into the peephole canvas, never shown itself. */
+.source-video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+.intro {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(5, 4, 3, 0.94);
+  text-align: center;
+}
+.intro h1 {
+  font-weight: normal;
+  font-size: clamp(1.8rem, 6vw, 3rem);
+  letter-spacing: 0.12em;
+  margin: 0 0 0.6em;
+  color: #e3d6b8;
+}
+.intro p { max-width: 36em; line-height: 1.5; margin: 0.4em 0; }
+.intro ul { max-width: 36em; text-align: left; line-height: 1.6; padding-left: 1.2em; margin: 1em 0; }
+.intro .hint { color: var(--text-dim); font-size: 0.9rem; }
+.intro button { margin-top: 1.4em; font-size: 1.15rem; padding: 12px 26px; }
