@@ -107,10 +107,8 @@ FRANK = Character(
 
 CHARACTERS = {c.key: c for c in (FRANK,)}
 
-# Tells: what gives a visitor away. Drawn fresh every visit, so no single rule always holds: an impostor
-# shows one at random, and a human sometimes shows a false one.
-TELLS_PER_IMPOSTOR = 1
-HUMAN_FALSE_TELL_CHANCE = 0.3
+# Tells: what gives an impostor away. Every impostor has all of them; what exactly slips is drawn fresh
+# every visit. A human has none.
 DRIFTING_FACTS = (1, 2)  # how many basic facts slip, min and max
 
 IMPOSTOR_SECRET = (
@@ -118,7 +116,7 @@ IMPOSTOR_SECRET = (
     "You believe you are this person; never hint at any of this."
 )
 # Tell 1: the impostor copied a person's story, not a life lived in the world, so a whole area of ordinary
-# knowledge is missing. A human may honestly not follow one of these areas either.
+# knowledge is missing.
 KNOWLEDGE_GAPS = (
     "the news and politics: who the president is, who runs the city, what has been happening in the world",
     "famous people: actors, singers, athletes, films, songs, TV shows",
@@ -155,15 +153,10 @@ class Tells:
 
 
 def draw_tells(character: Character, is_impostor: bool, rng=random) -> Tells:
-    if is_impostor:
-        drawn = [tell(character, rng) for tell in rng.sample(IMPOSTOR_TELLS, TELLS_PER_IMPOSTOR)]
-        return Tells("\n\n".join([IMPOSTOR_SECRET] + [text for text, _ in drawn]), tuple(note for _, note in drawn))
-    if rng.random() < HUMAN_FALSE_TELL_CHANCE:
-        gap = rng.choice(KNOWLEDGE_GAPS)
-        return Tells(f"You have never paid attention to {gap}. If they ask about it, say plainly that you don't "
-                     "follow that stuff, the way a tired, honest person would; if you half-remember something, say "
-                     "it unsure.", (f"false tell: doesn't follow {gap.split(':')[0]}",))
-    return Tells("", ())
+    if not is_impostor:
+        return Tells("", ())
+    drawn = [tell(character, rng) for tell in IMPOSTOR_TELLS]
+    return Tells("\n\n".join([IMPOSTOR_SECRET] + [text for text, _ in drawn]), tuple(note for _, note in drawn))
 
 
 def voice_for(character: Character, pressure: int) -> str:
