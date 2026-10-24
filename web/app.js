@@ -57,6 +57,14 @@ function knock(loudness = 1) {
   [0, 0.27, 0.54].forEach((dt) => knockOnce(t + dt + Math.random() * 0.03, loudness));
 }
 
+// Fists, not knuckles: fast, hard and uneven.
+function bang() {
+  audio ??= new AudioContext();
+  audio.resume();
+  const t = audio.currentTime + 0.05;
+  [0, 0.16, 0.31, 0.47].forEach((dt) => knockOnce(t + dt + Math.random() * 0.04, 1.6));
+}
+
 function startKnocking() {
   let loudness = 0.8;
   knock(loudness);
@@ -147,6 +155,7 @@ async function startVisit(path = "/api/visit") {
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
       if (topic !== "game") return;
       const event = JSON.parse(new TextDecoder().decode(payload));
+      if (event.type === "bang") bang();
       if (event.type === "error") {
         stopKnocking();
         status(event.message);
