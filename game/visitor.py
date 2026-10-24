@@ -9,6 +9,7 @@ import base64
 import json
 import logging
 import os
+import random
 import time
 from datetime import timedelta
 
@@ -17,7 +18,8 @@ import websockets
 from livekit import api, rtc
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 
-from .characters import FAREWELL, OPENING, Character, voice_for
+from . import ambient
+from .characters import FAREWELL, NUDGE, OPENING, Character, voice_for
 
 log = logging.getLogger("visitor")
 
@@ -29,7 +31,7 @@ PLAYER_IDENTITY = "player"
 SAMPLE_RATE = 24000
 MAX_DURATION_SECONDS = 6 * 60
 # Boson sometimes refuses a new avatar session right after the last one was released.
-AVATAR_ATTEMPTS = 3
+AVATAR_ATTEMPTS = 5
 AVATAR_RETRY_SECONDS = 2
 # Silence that ends the player's turn. Higgs defaults to 500 ms; shorter replies faster but may cut
 # the player off mid-pause.
@@ -50,6 +52,10 @@ FINISH_REPLY_TIMEOUT = 5
 # A reply the server may have just triggered from the player's last words, before we hear about it.
 LATE_REPLY_MS = 300
 FAREWELL_TIMEOUT = 25
+# Nobody has spoken for this long: the visitor bangs on the door and calls out.
+QUIET_NUDGE_SECONDS = 12
+# A human sighs or sniffs this many seconds into a silence, and again after another such gap.
+AMBIENT_GAP_SECONDS = (4, 8)
 
 
 def pressure_for(interruptions: int) -> int:
@@ -90,6 +96,8 @@ class Visitor:
         self.character = character
         self.is_impostor = is_impostor
         self.room_name = room_name
+        self._instructions = character.instructions(is_impostor)
+        self._session_instructions = self._instructions  # plus what they've already said; see _after_response
         self.done = asyncio.Event()
         self._boson = {"Authorization": f"Bearer {os.environ['BOSON_API_KEY']}"}
         self._session_id = None
@@ -115,6 +123,12 @@ class Visitor:
         self._farewell_id = None
         self._farewell_generated = False  # all its audio is with the avatar
         self._farewell_heard = asyncio.Event()
+        self._player_talking = False
+        self._player_spoke = False  # ever, this visit
+        self._quiet_since = None  # when both sides last fell silent
+        self._sounds: list[bytes] = []  # sighs and sniffs; humans only
+        self._ambient = False  # one is playing: it isn't speech, so it isn't interrupted or truncated
+        self._next_sound_at = 0.0
 
     def player_token(self) -> str:
         return livekit_token(self.room_name, PLAYER_IDENTITY, publish=True, subscribe=True)
@@ -142,7 +156,7 @@ class Visitor:
                     "type": "session.update",
                     "session": {
                         "model": "higgs-realtime",
-                        "instructions": self.character.instructions,
+                        "instructions": self._instructions,
                         "temperature": TEMPERATURE,
                         "audio": {
                             "input": {
@@ -160,8 +174,12 @@ class Visitor:
                         if publication.track is not None:
                             self._on_track(publication.track, publication, participant)
                 events = asyncio.create_task(self._handle_events())
+                if not self.is_impostor:
+                    asyncio.create_task(self._load_sounds())
+                quiet = asyncio.create_task(self._watch_quiet())
                 await asyncio.wait([events, asyncio.create_task(self.done.wait())], return_when=asyncio.FIRST_COMPLETED)
                 events.cancel()
+                quiet.cancel()
         except Exception:
             log.exception("visitor session failed")
             await self._publish({"type": "error", "message": "The visitor is gone. (Session failed; see server log.)"})
@@ -214,7 +232,7 @@ class Visitor:
                 # The visitor knocked; they speak first. Per-response instructions replace the session's,
                 # so the character has to be included.
                 asyncio.create_task(self._send({"type": "response.create", "response": {
-                    "instructions": f"{self.character.instructions}\n\n{OPENING}"}}))
+                    "instructions": f"{self._instructions}\n\n{OPENING}"}}))
 
     def _on_participant_left(self, participant):
         if participant.identity == PLAYER_IDENTITY:
@@ -232,7 +250,12 @@ class Visitor:
                 return
 
     def _on_playback_finished(self, ev):
+        if self._ambient:
+            self._ambient = False
+            return
         self._speaking = False
+        if not self._player_talking:
+            self._quiet_since = time.monotonic()
         if self._farewell_generated:
             self._farewell_heard.set()
         if ev.interrupted and self._item_id:
@@ -284,6 +307,7 @@ class Visitor:
                 self._item_pcm += pcm
                 await self._play(pcm)
                 self._speaking = True
+                self._quiet_since = None
             elif kind == "response.done":
                 self._active_response = None
                 self._idle.set()
@@ -295,10 +319,13 @@ class Visitor:
                 self._to_avatar.flush()
                 await self._after_response()
             elif kind == "input_audio_buffer.speech_started":
+                self._player_talking = self._player_spoke = True
+                self._quiet_since = None
                 if self._speaking:
                     await self._on_barge_in()
             elif kind == "input_audio_buffer.speech_stopped":
-                self._player_stopped = time.monotonic()
+                self._player_talking = False
+                self._player_stopped = self._quiet_since = time.monotonic()
             elif kind == "conversation.item.input_audio_transcription.completed":
                 log.info("PLAYER: %s", event.get("transcript"))
             elif kind == "response.output_audio_transcript.done":
@@ -309,17 +336,46 @@ class Visitor:
 
     async def _after_response(self):
         # Only between responses: changing config mid-response can break the session.
-        session = {"instructions": self.character.instructions + "\n\nWHAT YOU HAVE ALREADY SAID. Don't reuse "
-                   "these lines or their phrases on your own; say something new. But if they ask you to repeat "
-                   "something or ask again (your name, what happened to you tonight), answer it: the facts stay "
-                   "exactly the same, the words can differ.\n"
-                   + "\n".join(f"- {line}" for line in self._recent_lines())}
+        self._session_instructions = (
+            self._instructions + "\n\nWHAT YOU HAVE ALREADY SAID. Don't reuse these lines or their phrases on your "
+            "own; say something new. But if they ask you to repeat something or ask again (your name, what happened "
+            "to you tonight), answer it again in different words.\n"
+            + "\n".join(f"- {line}" for line in self._recent_lines()))
+        session = {"instructions": self._session_instructions}
         voice = voice_for(self.character, self.pressure)
         if voice != self._voice:
             self._voice = voice
             session["audio"] = {"output": {"voice": voice}}
             log.info("voice -> pressure %d", self.pressure)
         await self._send({"type": "session.update", "session": session})
+
+    async def _load_sounds(self):
+        self._sounds = await ambient.sounds_for(voice_for(self.character, 1))
+        log.info("%d ambient sounds ready", len(self._sounds))
+
+    async def _watch_quiet(self):
+        """While nobody talks, a human sighs and sniffs now and then. If the player stays quiet, the visitor
+        bangs on the door and calls out, again after each silence."""
+        while True:
+            await asyncio.sleep(0.5)
+            if not (self._quiet_since and not self._decided and self._idle.is_set() and not self._speaking
+                    and not self._ambient):
+                continue
+            now = time.monotonic()
+            if self._next_sound_at < self._quiet_since:  # a new silence
+                self._next_sound_at = self._quiet_since + random.uniform(*AMBIENT_GAP_SECONDS)
+            if now - self._quiet_since < QUIET_NUDGE_SECONDS:
+                if self._sounds and now >= self._next_sound_at:
+                    self._next_sound_at = now + random.uniform(*AMBIENT_GAP_SECONDS)
+                    self._ambient = True
+                    await self._play(random.choice(self._sounds))
+                    self._to_avatar.flush()
+            else:
+                self._quiet_since = None
+                log.info("player quiet: banging on the door")
+                await self._publish({"type": "bang"})
+                await self._send({"type": "response.create", "response": {
+                    "instructions": f"{self._session_instructions}\n\n{NUDGE[self._player_spoke]}"}})
 
     def _recent_lines(self) -> list[str]:
         # The opening plea too: it's the line they most like to fall back on.
@@ -340,18 +396,24 @@ class Visitor:
         try:
             await self._send({"type": "input_audio_buffer.clear"})
             await asyncio.sleep(LATE_REPLY_MS / 1000)
+            ended = True
             if self._active_response:
                 # Config can't change mid-response, and the thankful voice needs a session.update.
                 await self._send({"type": "response.cancel", "response_id": self._active_response})
-                await asyncio.wait_for(self._idle.wait(), FINISH_REPLY_TIMEOUT)
-            if opened and self.character.thankful_voice:
+                try:
+                    await asyncio.wait_for(self._idle.wait(), FINISH_REPLY_TIMEOUT)
+                except asyncio.TimeoutError:
+                    # Say them anyway: a new response interrupts one still in flight.
+                    log.warning("cancelled reply didn't end; sending last words anyway")
+                    ended = False
+            if opened and self.character.thankful_voice and ended:
                 await self._send({"type": "session.update",
                                   "session": {"audio": {"output": {"voice": self.character.thankful_voice}}}})
             farewell = FAREWELL[(opened, self.is_impostor)]
             # Stated before and after the character: per-response instructions are easy for it to ignore.
             await self._send({"type": "response.create", "response": {
                 "metadata": {"farewell": "true"},
-                "instructions": f"{farewell}\n\n{self.character.instructions}\n\nNOW: {farewell}"}})
+                "instructions": f"{farewell}\n\n{self._instructions}\n\nNOW: {farewell}"}})
             await asyncio.wait_for(self._farewell_heard.wait(), FAREWELL_TIMEOUT)
         except (asyncio.TimeoutError, websockets.ConnectionClosed):
             log.warning("visitor's last words cut short")
