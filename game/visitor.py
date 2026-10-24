@@ -17,7 +17,7 @@ import websockets
 from livekit import api, rtc
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 
-from .characters import OPENING, Character, voice_for
+from .characters import OPENING, Character, draw_tells, voice_for
 
 log = logging.getLogger("visitor")
 
@@ -79,6 +79,8 @@ class Visitor:
     def __init__(self, character: Character, is_impostor: bool, room_name: str):
         self.character = character
         self.is_impostor = is_impostor
+        self.tells = draw_tells(character, is_impostor)
+        self._instructions = "\n\n".join(filter(None, [character.instructions, self.tells.instructions]))
         self.room_name = room_name
         self.done = asyncio.Event()
         self._boson = {"Authorization": f"Bearer {os.environ['BOSON_API_KEY']}"}
@@ -128,7 +130,7 @@ class Visitor:
                     "type": "session.update",
                     "session": {
                         "model": "higgs-realtime",
-                        "instructions": self.character.instructions,
+                        "instructions": self._instructions,
                         "temperature": 0.6,
                         "audio": {
                             "input": {
@@ -185,6 +187,7 @@ class Visitor:
                 self._session_id = (await r.json())["id"]
         log.info("avatar %s in room %s (%s, %s)", self._session_id, self.room_name, self.character.key,
                  "IMPOSTOR" if self.is_impostor else "human")
+        log.info("tells: %s", " | ".join(self.tells.notes) or "none")
 
     def _on_track(self, track, _publication, participant):
         if participant.identity == PLAYER_IDENTITY and track.kind == rtc.TrackKind.KIND_AUDIO:
@@ -194,7 +197,7 @@ class Visitor:
                 # The visitor knocked; they speak first. Per-response instructions replace the session's,
                 # so the character has to be included.
                 asyncio.create_task(self._send({"type": "response.create", "response": {
-                    "instructions": f"{self.character.instructions}\n\n{OPENING}"}}))
+                    "instructions": f"{self._instructions}\n\n{OPENING}"}}))
 
     def _on_participant_left(self, participant):
         if participant.identity == PLAYER_IDENTITY:
@@ -286,7 +289,7 @@ class Visitor:
 
     async def _after_response(self):
         # Only between responses: changing config mid-response can break the session.
-        session = {"instructions": self.character.instructions + "\n\nWHAT YOU HAVE ALREADY SAID. Don't reuse "
+        session = {"instructions": self._instructions + "\n\nWHAT YOU HAVE ALREADY SAID. Don't reuse "
                    "these lines or their phrases on your own; say something new. But if they ask you to repeat "
                    "something or ask again (your name, where your bus broke down), answer it: the facts stay "
                    "exactly the same, the words can differ.\n"
