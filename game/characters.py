@@ -108,8 +108,8 @@ FRANK = Character(
 CHARACTERS = {c.key: c for c in (FRANK,)}
 
 # Tells: what gives a visitor away. Drawn fresh every visit, so no single rule always holds: an impostor
-# shows a random few, and a human sometimes shows a false one.
-TELLS_PER_IMPOSTOR = 2
+# shows one at random, and a human sometimes shows a false one.
+TELLS_PER_IMPOSTOR = 1
 HUMAN_FALSE_TELL_CHANCE = 0.3
 DRIFTING_FACTS = (1, 2)  # how many basic facts slip, min and max
 
