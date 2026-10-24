@@ -20,8 +20,14 @@ from livekit.agents.voice.avatar import DataStreamAudioOutput
 
 from . import ambient
 from .characters import FAREWELL, NUDGE, OPENING, Character, voice_for
+from .delivery import IMPOSTOR_FLAT_FROM, TAG_RULES, Mood, asked_before, deliver, leading_tags, spoken
 
 log = logging.getLogger("visitor")
+
+# A line's length until TTS 3 has finished it and the real length is known.
+EST_MS_PER_CHAR = 60
+# The page gives each visit 3 minutes; in the last one the visitor may lose its temper sooner (Mood).
+LATE_SECONDS = 120
 
 BOSON_BASE_URL = "https://api.boson.ai/v1"
 BOSON_REALTIME_URL = "wss://api.boson.ai/v1/realtime"
@@ -96,7 +102,11 @@ class Visitor:
         self.character = character
         self.is_impostor = is_impostor
         self.room_name = room_name
-        self._instructions = character.instructions(is_impostor)
+        # On (default): Realtime only writes each line, with delivery tags, and Higgs TTS 3 speaks it in one voice,
+        # so the visitor can sound scared, angry or in tears (see delivery.py). EMOTION_TTS=0: Realtime speaks.
+        # Read here, not at import: the server loads .env after importing this module.
+        self._emotion_tts = os.environ.get("EMOTION_TTS", "1") != "0"
+        self._instructions = character.instructions(is_impostor) + (f"\n\n{TAG_RULES}" if self._emotion_tts else "")
         self._session_instructions = self._instructions  # plus what they've already said; see _after_response
         self.done = asyncio.Event()
         self._boson = {"Authorization": f"Bearer {os.environ['BOSON_API_KEY']}"}
@@ -129,6 +139,21 @@ class Visitor:
         self._sounds: list[bytes] = []  # sighs and sniffs; humans only
         self._ambient = False  # one is playing: it isn't speech, so it isn't interrupted or truncated
         self._next_sound_at = 0.0
+        # TTS mode: the text of each reply being written, the TTS 3 task speaking a line, and the line's words,
+        # timed across its audio to work out how much of it the player heard.
+        self._http = None
+        self._replies: dict[str, tuple[str, str]] = {}  # response id -> (item id, text so far)
+        self._tts_task = None
+        self._line_tags = ""
+        self._line_words: list[str] = []
+        self._line_ms = 0.0
+        self._answer_ms = 0.0  # where the line starts in the item's audio (after a replay)
+        # TTS mode: the visitor's mood, and the player's words it reacts to (their latest, not yet answered).
+        self._mood = Mood()
+        self._first_words = None  # when the visitor started speaking: the page's clock starts about then
+        self._player_said: list[str] = []
+        self._player_line = ""
+        self._player_repeated = False
 
     def player_token(self) -> str:
         return livekit_token(self.room_name, PLAYER_IDENTITY, publish=True, subscribe=True)
@@ -150,23 +175,25 @@ class Visitor:
             )
             self._to_avatar.on("playback_finished", self._on_playback_finished)
             self._room.on("participant_disconnected", self._on_participant_left)
+            if self._emotion_tts:
+                self._http = aiohttp.ClientSession(headers=self._boson)  # one connection for every line
             async with websockets.connect(BOSON_REALTIME_URL, additional_headers=self._boson, max_size=None) as ws:
                 self._ws = ws
-                await self._send({
-                    "type": "session.update",
-                    "session": {
-                        "model": "higgs-realtime",
-                        "instructions": self._instructions,
-                        "temperature": TEMPERATURE,
-                        "audio": {
-                            "input": {
-                                "turn_detection": {"type": "server_vad", "threshold": 0.85, "silence_duration_ms": SILENCE_MS},
-                                "transcription": {"model": "higgs-stt-3.1"},
-                            },
-                            "output": {"voice": self._voice},
+                session = {
+                    "model": "higgs-realtime",
+                    "instructions": self._instructions,
+                    "temperature": TEMPERATURE,
+                    "audio": {
+                        "input": {
+                            "turn_detection": {"type": "server_vad", "threshold": 0.85, "silence_duration_ms": SILENCE_MS},
+                            "transcription": {"model": "higgs-stt-3.1"},
                         },
+                        "output": {"voice": self._voice},
                     },
-                })
+                }
+                if self._emotion_tts:
+                    session["output_modalities"] = ["text"]  # either text or audio, never both
+                await self._send({"type": "session.update", "session": session})
                 # Only now: forwarding the mic needs the WebSocket.
                 self._room.on("track_subscribed", self._on_track)
                 for participant in self._room.remote_participants.values():
@@ -188,6 +215,10 @@ class Visitor:
 
     async def close(self):
         self.done.set()
+        self._stop_tts()
+        if self._http:
+            http, self._http = self._http, None
+            await http.close()
         if self._session_id:
             session_id, self._session_id = self._session_id, None
             async with aiohttp.ClientSession(headers=self._boson) as http:
@@ -258,7 +289,13 @@ class Visitor:
             self._quiet_since = time.monotonic()
         if self._farewell_generated:
             self._farewell_heard.set()
-        if ev.interrupted and self._item_id:
+        if ev.interrupted and self._item_id and self._emotion_tts:
+            item_id, self._item_id = self._item_id, None  # only once per line
+            heard = self._heard(ev.playback_position * 1000)
+            # Once the door is decided, only the farewell matters; leave the conversation alone.
+            if heard is not None and not self._decided:
+                asyncio.create_task(self._keep_heard(item_id, heard))
+        elif ev.interrupted and self._item_id:
             # Make the stored conversation match what the player actually heard.
             asyncio.create_task(self._send({
                 "type": "conversation.item.truncate", "item_id": self._item_id,
@@ -268,6 +305,7 @@ class Visitor:
     async def _on_barge_in(self):
         now = time.monotonic()
         self._interruptions += 1
+        log.info("interrupted #%d (pressure %d)", self._interruptions, self.pressure)
         if self.is_impostor and self.pressure >= 3:
             # Decided now (not on playback_finished) so the replay always precedes the answer.
             played_ms = min(pcm_ms(len(self._item_pcm)), (now - self._item_started) * 1000)
@@ -279,6 +317,149 @@ class Visitor:
 
     async def _play(self, pcm: bytes):
         await self._to_avatar.capture_frame(rtc.AudioFrame(pcm, SAMPLE_RATE, 1, len(pcm) // 2))
+
+    async def _start_item(self, item_id: str):
+        """A reply's first audio: reset the item's state, and play a pending replay ahead of it."""
+        if self._player_stopped:
+            log.info("reply audio %.0f ms after player stopped (+%d ms silence detection)",
+                     (time.monotonic() - self._player_stopped) * 1000, SILENCE_MS)
+            self._player_stopped = None
+        self._item_id = item_id
+        self._item_pcm = bytearray()
+        self._item_started = time.monotonic()
+        self._answer_ms = 0.0
+        if self._replay:
+            replay, self._replay = self._replay, None
+            log.info("replay: %.0f ms of the cut-off line", pcm_ms(len(replay)))
+            await self._play(bytes(ms_bytes(REPLAY_PAUSE_MS)) + replay)
+            self._answer_ms = REPLAY_PAUSE_MS + pcm_ms(len(replay))
+
+    def _on_reply_done(self, response: dict):
+        """TTS mode: Realtime has finished writing a reply. Speak it, unless the player can't hear it now."""
+        item_id, text = self._replies.pop(response["id"], (None, ""))
+        farewell = response["id"] == self._farewell_id
+        if self._decided and not farewell:
+            return
+        if response.get("status") != "completed" or not spoken(text) or (self._player_talking and not farewell):
+            # The server cancels a reply once the player speaks; one finished while they were already talking
+            # is dropped too. Never heard, so it shouldn't stay in the conversation either.
+            log.info("reply not spoken (%s): %s", response.get("status"), text)
+            if item_id:
+                asyncio.create_task(self._delete_item(item_id))
+            if farewell:
+                self._farewell_heard.set()  # nothing to wait for
+            return
+        if not farewell:
+            late = self._first_words is not None and time.monotonic() - self._first_words >= LATE_SECONDS
+            steered = self._mood.steer(text, player=self._player_line, repeated=self._player_repeated, late=late)
+            if leading_tags(steered) != leading_tags(text):
+                log.info("mood: %s -> %s", leading_tags(text) or "no tags", leading_tags(steered))
+            text = steered
+            self._player_line, self._player_repeated = "", False  # answered
+        # An impostor's last words are always flat: FAREWELL makes them too calm, or cold.
+        pressure = max(self.pressure, IMPOSTOR_FLAT_FROM) if farewell and self.is_impostor else self.pressure
+        line = deliver(text, is_impostor=self.is_impostor, pressure=pressure)
+        log.info("VISITOR: %s", line)
+        self._said.append(spoken(line))
+        self._stop_tts()
+        self._tts_task = asyncio.create_task(self._speak(item_id, line, farewell))
+
+    async def _speak(self, item_id: str, line: str, farewell: bool):
+        """TTS mode: TTS 3 says the line, streamed to the avatar as it arrives, in the visitor's one voice."""
+        body = {"model": "higgs-tts-3", "input": line, "voice": self._voice, "response_format": "pcm", "stream": True}
+        asked = time.monotonic()
+        started = False
+        try:
+            async with self._http.post(f"{BOSON_BASE_URL}/audio/speech", json=body) as r:
+                if r.status >= 400:
+                    raise RuntimeError(f"{r.status} {await r.text()}")
+                odd = b""  # PCM16 comes in whole samples: a split byte waits for the next chunk
+                async for chunk in r.content.iter_any():
+                    chunk, odd = odd + chunk, b""
+                    if len(chunk) % 2:
+                        chunk, odd = chunk[:-1], chunk[-1:]
+                    if not chunk:
+                        continue
+                    if not started:
+                        started = True
+                        log.info("TTS first audio after %.0f ms", (time.monotonic() - asked) * 1000)
+                        if self._first_words is None:
+                            self._first_words = time.monotonic()
+                        await self._start_item(item_id)
+                        self._start_line(line)
+                    self._item_pcm += chunk
+                    await self._play(chunk)
+                    self._speaking = True
+                    self._quiet_since = None
+        except asyncio.CancelledError:
+            if not started:
+                await self._delete_item(item_id)
+            elif not self._decided:  # decide() ends the segment itself
+                # Cut off mid-stream: end the segment, or the avatar drops the next line with the rest of this one.
+                self._to_avatar.flush()
+            raise
+        except Exception:
+            log.exception("TTS failed; the rest of the line is skipped")
+            if not started:
+                await self._delete_item(item_id)
+        if started:
+            self._to_avatar.flush()
+            self._line_ms = pcm_ms(len(self._item_pcm))  # the line's real length is known now
+        if farewell:
+            if started:
+                self._farewell_generated = True
+            else:
+                self._farewell_heard.set()
+
+    def _speaking_soon(self) -> bool:
+        """TTS mode: a line's text is done but its audio hasn't reached the avatar yet."""
+        return self._tts_task is not None and not self._tts_task.done() and not self._speaking
+
+    def _stop_tts(self):
+        if self._tts_task:
+            self._tts_task.cancel()
+            self._tts_task = None
+
+    async def _delete_item(self, item_id: str):
+        try:
+            await self._send({"type": "conversation.item.delete", "item_id": item_id})
+        except websockets.ConnectionClosed:
+            pass
+
+    def _start_line(self, line: str):
+        """TTS mode: the line's words, timed at an estimated pace until TTS 3 has finished it."""
+        words = spoken(line)
+        self._line_tags = leading_tags(line)
+        self._line_words = words.split()
+        self._line_ms = len(words) * EST_MS_PER_CHAR
+
+    def _word_times(self) -> list[float]:
+        """When each word of the line starts, in ms into the item's audio: spread by length across the line."""
+        chars = sum(len(word) + 1 for word in self._line_words) or 1
+        times, at = [], 0
+        for word in self._line_words:
+            times.append(self._answer_ms + self._line_ms * at / chars)
+            at += len(word) + 1
+        return times
+
+    def _heard(self, position_ms: float) -> str | None:
+        """TTS mode: what the conversation should keep of the line the player cut off position_ms into the item's
+        audio: its tags and the words the avatar had started saying ("" if none), or None if it got them all."""
+        heard = [word for word, at in zip(self._line_words, self._word_times()) if at < position_ms]
+        if len(heard) == len(self._line_words):
+            return None
+        return f"{self._line_tags}{' '.join(heard)}—" if heard else ""
+
+    async def _keep_heard(self, item_id: str, heard: str):
+        """TTS mode: text can't be truncated, so the cut-off line is replaced with the part the player heard."""
+        log.info("player heard: %s", heard or "nothing")
+        await self._delete_item(item_id)
+        if heard:
+            try:
+                await self._send({"type": "conversation.item.create", "item": {
+                    "type": "message", "role": "assistant", "content": [{"type": "text", "text": heard}]}})
+            except websockets.ConnectionClosed:
+                pass
 
     async def _handle_events(self):
         async for message in self._ws:
@@ -294,23 +475,26 @@ class Visitor:
                     continue
                 pcm = base64.b64decode(event["delta"])
                 if self._item_id != event["item_id"]:
-                    if self._player_stopped:
-                        log.info("reply audio %.0f ms after player stopped (+%d ms silence detection)",
-                                 (time.monotonic() - self._player_stopped) * 1000, SILENCE_MS)
-                        self._player_stopped = None
-                    self._item_id = event["item_id"]
-                    self._item_pcm = bytearray()
-                    self._item_started = time.monotonic()
-                    if self._replay:
-                        replay, self._replay = self._replay, None
-                        await self._play(bytes(ms_bytes(REPLAY_PAUSE_MS)) + replay)
+                    await self._start_item(event["item_id"])
                 self._item_pcm += pcm
                 await self._play(pcm)
                 self._speaking = True
                 self._quiet_since = None
+            elif kind == "response.output_text.delta":
+                # TTS mode. The item id only comes with the deltas, not with output_text.done.
+                if self._decided and event.get("response_id") != self._farewell_id:
+                    continue
+                item_id, text = self._replies.get(event["response_id"], (event["item_id"], ""))
+                self._replies[event["response_id"]] = (item_id, text + event.get("delta", ""))
             elif kind == "response.done":
                 self._active_response = None
                 self._idle.set()
+                if self._emotion_tts:
+                    # Flushing and marking the farewell as generated wait until TTS 3 has spoken the line.
+                    self._on_reply_done(event["response"])
+                    if not self._decided:
+                        await self._after_response()
+                    continue
                 if self._decided:
                     if event["response"]["id"] == self._farewell_id:
                         self._to_avatar.flush()
@@ -321,6 +505,8 @@ class Visitor:
             elif kind == "input_audio_buffer.speech_started":
                 self._player_talking = self._player_spoke = True
                 self._quiet_since = None
+                if self._emotion_tts:
+                    self._stop_tts()  # first: nothing more reaches the avatar once the barge-in clears it
                 if self._speaking:
                     await self._on_barge_in()
             elif kind == "input_audio_buffer.speech_stopped":
@@ -328,6 +514,10 @@ class Visitor:
                 self._player_stopped = self._quiet_since = time.monotonic()
             elif kind == "conversation.item.input_audio_transcription.completed":
                 log.info("PLAYER: %s", event.get("transcript"))
+                if self._emotion_tts:
+                    self._player_line = event.get("transcript") or ""
+                    self._player_repeated = asked_before(self._player_line, self._player_said)
+                    self._player_said.append(self._player_line)
             elif kind == "response.output_audio_transcript.done":
                 log.info("VISITOR: %s", event["transcript"])
                 self._said.append(event["transcript"])
@@ -343,7 +533,8 @@ class Visitor:
             + "\n".join(f"- {line}" for line in self._recent_lines()))
         session = {"instructions": self._session_instructions}
         voice = voice_for(self.character, self.pressure)
-        if voice != self._voice:
+        # TTS mode keeps one voice all visit: the emotion is in the delivery tags instead.
+        if voice != self._voice and not self._emotion_tts:
             self._voice = voice
             session["audio"] = {"output": {"voice": voice}}
             log.info("voice -> pressure %d", self.pressure)
@@ -359,7 +550,7 @@ class Visitor:
         while True:
             await asyncio.sleep(0.5)
             if not (self._quiet_since and not self._decided and self._idle.is_set() and not self._speaking
-                    and not self._ambient):
+                    and not self._ambient and not self._speaking_soon()):
                 continue
             now = time.monotonic()
             if self._next_sound_at < self._quiet_since:  # a new silence
@@ -389,6 +580,8 @@ class Visitor:
         self._listening = False
         self._decided = True
         self._replay = None
+        self._player_talking = False
+        self._stop_tts()  # TTS mode: the line being spoken stops reaching the avatar
         # Silence whatever they were saying, and end that audio segment: the avatar discards the rest of a
         # cleared segment, so the last words have to start a new one.
         self._to_avatar.clear_buffer()
@@ -406,7 +599,8 @@ class Visitor:
                     # Say them anyway: a new response interrupts one still in flight.
                     log.warning("cancelled reply didn't end; sending last words anyway")
                     ended = False
-            if opened and self.character.thankful_voice and ended:
+            # TTS mode keeps the voice; the relief comes through the delivery tags.
+            if opened and self.character.thankful_voice and ended and not self._emotion_tts:
                 await self._send({"type": "session.update",
                                   "session": {"audio": {"output": {"voice": self.character.thankful_voice}}}})
             farewell = FAREWELL[(opened, self.is_impostor)]
