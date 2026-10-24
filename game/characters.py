@@ -127,7 +127,7 @@ KNOWLEDGE_GAPS = (
 
 def _knowledge_gap(character: Character, rng) -> tuple[str, str]:
     gap = rng.choice(KNOWLEDGE_GAPS)
-    return (f"You know nothing at all about {gap}, whatever else you were told. If they ask about it, you cannot "
+    return (f"Whatever else you were told, you know nothing at all about {gap}. If they ask about it, you cannot "
             "answer: dodge it, change the "
             "subject, or give a vague answer that could fit anything. Never explain why you don't know."), \
         f"knowledge gap: {gap.split(':')[0]}"
