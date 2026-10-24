@@ -127,7 +127,8 @@ KNOWLEDGE_GAPS = (
 
 def _knowledge_gap(character: Character, rng) -> tuple[str, str]:
     gap = rng.choice(KNOWLEDGE_GAPS)
-    return (f"You know nothing at all about {gap}. If they ask about it, you cannot answer: dodge it, change the "
+    return (f"You know nothing at all about {gap}, whatever else you were told. If they ask about it, you cannot "
+            "answer: dodge it, change the "
             "subject, or give a vague answer that could fit anything. Never explain why you don't know."), \
         f"knowledge gap: {gap.split(':')[0]}"
 
@@ -138,7 +139,8 @@ def _memory_drift(character: Character, rng) -> tuple[str, str]:
     slips = {label: rng.choice(character.drifts[label]) for label in labels}
     lines = "\n".join(f"- {label}: the first time, say {character.facts[label]}; every time after that, say {alt}"
                       for label, alt in slips.items())
-    return ("Some of YOUR BASIC FACTS slip, and this overrides them. Say each version just as surely, and never "
+    return ("Some of YOUR BASIC FACTS slip, and this overrides them and every rule about keeping your facts the "
+            "same. Say each version just as surely, and never "
             f"notice, admit or explain the difference, even if they point it out:\n{lines}"), \
         "memory drift: " + "; ".join(f"{character.facts[label]} -> {alt}" for label, alt in slips.items())
 

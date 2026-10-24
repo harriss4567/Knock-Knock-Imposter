@@ -224,6 +224,7 @@ class Visitor:
     async def _on_barge_in(self):
         now = time.monotonic()
         self._interruptions += 1
+        log.info("interrupted #%d (pressure %d), heard: %s", self._interruptions, self.pressure, self._shown)
         if self.is_impostor and self.pressure >= 3:
             # Decided now (not on playback_finished) so the replay always precedes the answer.
             played_ms = min(pcm_ms(len(self._item_pcm)), (now - self._item_started) * 1000)
@@ -259,6 +260,7 @@ class Visitor:
                     await self._subtitle("new")
                     if self._replay:
                         replay, self._replay = self._replay, None
+                        log.info("replay: %s", self._replay_text)
                         await self._play(bytes(ms_bytes(REPLAY_PAUSE_MS)) + replay)
                         # The replayed words come back on screen too; the answer's text follows them.
                         self._show_later(REPLAY_PAUSE_MS, "add", self._replay_text)
