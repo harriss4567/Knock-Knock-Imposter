@@ -11,3 +11,6 @@ __pycache__/
 
 # Recordings from exploration
 explore/out/
+
+# Voice recordings (friend's voice, not for the public repo)
+voices/
