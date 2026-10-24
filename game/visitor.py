@@ -97,6 +97,11 @@ class Visitor:
         self._greeted = False
         self._player_stopped = None  # when the player last stopped talking, to measure reply latency
         self._said: list[str] = []
+        # Subtitles: each piece of transcript is shown when the avatar reaches it in the audio.
+        self._text_ms = 0.0
+        self._shown = ""  # subtitle text the player has seen for the current item
+        self._replay_text = ""
+        self._subtitle_tasks: list[asyncio.Task] = []
 
     def player_token(self) -> str:
         return livekit_token(self.room_name, PLAYER_IDENTITY, publish=True, subscribe=True)
@@ -221,8 +226,11 @@ class Visitor:
             played_ms = min(pcm_ms(len(self._item_pcm)), (now - self._item_started) * 1000)
             if played_ms >= MIN_REPLAY_MS:
                 self._replay = bytes(self._item_pcm[: ms_bytes(played_ms)])
+                self._replay_text = self._shown
         self._to_avatar.clear_buffer()
         self._speaking = False
+        self._cancel_subtitles()
+        await self._subtitle("cut")
         await self._publish({"type": "pressure", "level": self.pressure})
 
     async def _play(self, pcm: bytes):
@@ -242,12 +250,24 @@ class Visitor:
                     self._item_id = event["item_id"]
                     self._item_pcm = bytearray()
                     self._item_started = time.monotonic()
+                    self._text_ms = 0.0
+                    self._shown = ""
+                    self._cancel_subtitles()
+                    await self._subtitle("new")
                     if self._replay:
                         replay, self._replay = self._replay, None
                         await self._play(bytes(ms_bytes(REPLAY_PAUSE_MS)) + replay)
+                        # The replayed words come back on screen too; the answer's text follows them.
+                        self._show_later(REPLAY_PAUSE_MS, "add", self._replay_text)
+                        self._text_ms = REPLAY_PAUSE_MS + pcm_ms(len(replay))
+                        self._show_later(self._text_ms, "new")
                 self._item_pcm += pcm
                 await self._play(pcm)
                 self._speaking = True
+            elif kind == "response.output_audio_transcript.length":
+                # This text starts _text_ms into the item's audio.
+                self._show_later(self._text_ms, "add", event.get("delta", ""))
+                self._text_ms += event.get("length_ms", 0)
             elif kind == "response.done":
                 self._to_avatar.flush()
                 await self._after_response()
@@ -277,6 +297,24 @@ class Visitor:
             session["audio"] = {"output": {"voice": voice}}
             log.info("voice -> pressure %d", self.pressure)
         await self._send({"type": "session.update", "session": session})
+
+    def _show_later(self, at_ms: float, action: str, text: str = ""):
+        """Change the subtitle when the current item's audio reaches at_ms."""
+        delay = self._item_started + at_ms / 1000 - time.monotonic()
+        self._subtitle_tasks.append(asyncio.create_task(self._show_at(delay, action, text)))
+
+    async def _show_at(self, delay: float, action: str, text: str):
+        await asyncio.sleep(max(0.0, delay))
+        self._shown = "" if action == "new" else self._shown + text
+        await self._subtitle(action, text)
+
+    def _cancel_subtitles(self):
+        for task in self._subtitle_tasks:
+            task.cancel()
+        self._subtitle_tasks.clear()
+
+    async def _subtitle(self, action: str, text: str = ""):
+        await self._publish({"type": "subtitle", "action": action, "text": text})
 
     async def _send(self, event: dict):
         await self._ws.send(json.dumps(event))

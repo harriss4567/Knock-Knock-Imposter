@@ -120,6 +120,22 @@ html, body {
   min-height: 1.4em;
 }
 
+/* What the visitor says, as it is said: over the lower door panel, under the peephole. */
+.subtitle {
+  position: absolute;
+  bottom: 12vh;
+  left: 16px;
+  right: 16px;
+  max-width: 34em;
+  margin: 0 auto;
+  text-align: center;
+  font-size: clamp(1rem, 2.4vh, 1.35rem);
+  line-height: 1.45;
+  color: #efe2c4;
+  text-shadow: 0 0 6px #000, 0 0 12px #000;
+  pointer-events: none;
+}
+
 .controls {
   position: absolute;
   bottom: 3vh;

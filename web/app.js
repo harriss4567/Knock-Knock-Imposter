@@ -8,6 +8,14 @@ function status(text) {
   $("status").textContent = text;
 }
 
+// What the visitor says, word by word as the avatar says it. Trails off when interrupted.
+function subtitle({ action, text }) {
+  const el = $("subtitle");
+  if (action === "new") el.textContent = "";
+  else if (action === "add") el.textContent += text;
+  else if (action === "cut") el.textContent += "…";
+}
+
 async function startVisit() {
   $("intro").classList.add("hidden");
   status("Someone is knocking.");
@@ -36,10 +44,14 @@ async function startVisit() {
     room.on(LivekitClient.RoomEvent.DataReceived, (payload, _participant, _kind, topic) => {
       if (topic !== "game") return;
       const event = JSON.parse(new TextDecoder().decode(payload));
+      if (event.type === "subtitle") return subtitle(event);
       if (event.type === "error") status(event.message);
       console.log("game event", event);
     });
-    room.on(LivekitClient.RoomEvent.Disconnected, () => status("The porch is empty."));
+    room.on(LivekitClient.RoomEvent.Disconnected, () => {
+      subtitle({ action: "new" });
+      status("The porch is empty.");
+    });
 
     await room.connect(url, token);
     await room.localParticipant.setMicrophoneEnabled(true);
