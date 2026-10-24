@@ -18,6 +18,8 @@ uniform float u_time;
 uniform float u_light;      // porch light brightness, flickers in JS
 uniform float u_aspect;     // video width / height
 uniform float u_hasVideo;
+uniform float u_flash;      // 0..1, the reveal
+uniform float u_shadow;     // 0..1, how dark the lower face is
 
 float rand(vec2 co) { return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453); }
 
@@ -58,7 +60,7 @@ void main() {
   col = mix(vec3(lum), col, 0.25) * vec3(1.05, 0.82, 0.52);
 
   // Light from above: the lower face (mouth, chin) falls into shadow.
-  float shade = 1.0 - 0.6 * (1.0 - smoothstep(-0.85, 0.05, p.y));
+  float shade = 1.0 - u_shadow * (1.0 - smoothstep(-0.85, 0.05, p.y));
   col *= shade * u_light;
 
   // Crush blacks, vignette the lens, add grain.
@@ -66,6 +68,7 @@ void main() {
   col *= 1.0 - 0.9 * smoothstep(0.5, 1.0, r);
   col += (rand(v_uv * 731.0 + u_time) - 0.5) * 0.09;
   col += vec3(0.02, 0.014, 0.008); // the darkness outside is never fully black
+  col = mix(col, vec3(1.0, 0.93, 0.8), u_flash);
 
   gl_FragColor = vec4(col, 1.0);
 }`;
@@ -76,6 +79,8 @@ class Peephole {
     this.video = null;
     this.light = 1.0;
     this.dipUntil = 0;
+    this.flashAt = -1e9;
+    this.shadow = 0.6;
     const gl = canvas.getContext("webgl", { antialias: false });
     if (!gl) throw new Error("WebGL is not available");
     this.gl = gl;
@@ -91,7 +96,7 @@ class Peephole {
     gl.linkProgram(program);
     gl.useProgram(program);
     this.u = {};
-    for (const name of ["u_tex", "u_time", "u_light", "u_aspect", "u_hasVideo"]) {
+    for (const name of ["u_tex", "u_time", "u_light", "u_aspect", "u_hasVideo", "u_flash", "u_shadow"]) {
       this.u[name] = gl.getUniformLocation(program, name);
     }
 
@@ -112,6 +117,11 @@ class Peephole {
   }
 
   setVideo(video) { this.video = video; }
+
+  setShadow(strength) { this.shadow = strength; }
+
+  // A burst of white light through the lens that fades out over a second and a half.
+  flash() { this.flashAt = performance.now(); }
 
   // A tired bulb: a slow hum, and every few seconds a sharp dip.
   flicker(t) {
@@ -138,6 +148,8 @@ class Peephole {
     gl.uniform1f(this.u.u_light, this.flicker(t));
     gl.uniform1f(this.u.u_aspect, hasVideo ? video.videoWidth / video.videoHeight : 0.75);
     gl.uniform1f(this.u.u_hasVideo, hasVideo ? 1 : 0);
+    gl.uniform1f(this.u.u_shadow, this.shadow);
+    gl.uniform1f(this.u.u_flash, Math.max(0, 1 - (t - this.flashAt) / 1500) ** 2);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     requestAnimationFrame((t2) => this.frame(t2));
   }
