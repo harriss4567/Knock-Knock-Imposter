@@ -1,0 +1,43 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>Probe viewer</title>
+<style>
+  body { background: #111; color: #ccc; font: 14px system-ui; }
+  video { display: block; width: 480px; height: 640px; background: #000; }
+  #status { white-space: pre-wrap; font: 12px ui-monospace, monospace; }
+</style>
+<button id="join">Join</button>
+<video id="avatar" autoplay playsinline></video>
+<div id="status"></div>
+<script src="https://unpkg.com/livekit-client@2.15.0/dist/livekit-client.umd.js"></script>
+<script>
+  const status = (msg) => {
+    document.getElementById("status").textContent += new Date().toLocaleTimeString() + "  " + msg + "\n";
+    console.log(msg);
+  };
+  window.onerror = (msg) => status("ERROR: " + msg);
+  if (!window.LivekitClient) status("ERROR: livekit-client failed to load (check internet)");
+
+  const params = new URLSearchParams(location.search);
+  if (!params.get("url") || !params.get("token")) status("ERROR: url/token missing; open the link the probe printed");
+  const room = new LivekitClient.Room();
+  room.on(LivekitClient.RoomEvent.ParticipantConnected, (p) => status("joined: " + p.identity));
+  room.on(LivekitClient.RoomEvent.Disconnected, (reason) => status("disconnected: " + reason));
+  room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+    status(`track: ${participant.identity} ${track.kind}`);
+    if (participant.identity !== "boson-avatar") return;
+    if (track.kind === "video") track.attach(document.getElementById("avatar"));
+    else document.body.appendChild(track.attach());
+  });
+  document.getElementById("join").onclick = async () => {
+    try {
+      status("connecting...");
+      await room.connect(params.get("url"), params.get("token"));
+      status("connected. in room: " + [...room.remoteParticipants.values()].map((p) => p.identity).join(", "));
+      await room.localParticipant.setMicrophoneEnabled(true);
+      status("microphone on. say something.");
+    } catch (e) {
+      status("ERROR: " + (e.message || e));
+    }
+  };
+</script>

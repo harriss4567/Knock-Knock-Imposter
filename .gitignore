@@ -1,0 +1,13 @@
+# Secrets
+.env
+
+# Plan docs stay local
+knock_knock_imposter_en.md
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Recordings from exploration
+explore/out/

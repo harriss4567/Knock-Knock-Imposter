@@ -1,0 +1,5 @@
+livekit-agents>=1.8,<1.9
+av==15.1.0  # last version with a wheel for macOS 13
+websockets
+requests
+certifi
