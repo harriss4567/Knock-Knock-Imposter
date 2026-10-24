@@ -120,6 +120,43 @@ html, body {
   min-height: 1.4em;
 }
 
+/* The electronic wall clock: minutes until dawn. */
+.clock {
+  position: absolute;
+  top: 14vh;
+  left: calc(50% + min(calc(min(92vh, 900px) * 0.48), 92vw) / 2 + 6vw);
+  padding: 6px 14px 4px;
+  font-family: "Share Tech Mono", "Courier New", monospace;
+  font-size: 2.2rem;
+  letter-spacing: 0.08em;
+  color: #c0201a;
+  text-shadow: 0 0 8px rgba(255, 40, 20, 0.55);
+  background: #0a0605;
+  border: 2px solid #1e1712;
+  border-radius: 4px;
+  box-shadow: inset 0 0 12px #000, 0 6px 18px rgba(0,0,0,0.8);
+}
+.clock.urgent { color: #ff3a24; animation: blink 1s steps(2, start) infinite; }
+@keyframes blink { 50% { opacity: 0.35; } }
+@media (max-aspect-ratio: 1/1) {
+  .clock { top: auto; bottom: calc(3vh + 56px); left: 50%; transform: translateX(-50%); font-size: 1.6rem; }
+}
+
+.reveal {
+  position: absolute;
+  top: 48%;
+  left: 16px;
+  right: 16px;
+  margin: 0;
+  text-align: center;
+  font-size: clamp(1.3rem, 4vw, 2rem);
+  line-height: 1.4;
+  color: #efe2c4;
+  text-shadow: 0 0 14px #000, 0 0 4px #000;
+  animation: fade-in 1.2s ease-out;
+}
+@keyframes fade-in { from { opacity: 0; } }
+
 .controls {
   position: absolute;
   bottom: 3vh;

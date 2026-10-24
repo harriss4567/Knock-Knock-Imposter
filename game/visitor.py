@@ -17,7 +17,7 @@ import websockets
 from livekit import api, rtc
 from livekit.agents.voice.avatar import DataStreamAudioOutput
 
-from .characters import OPENING, Character, voice_for
+from .characters import FAREWELL, OPENING, Character, voice_for
 
 log = logging.getLogger("visitor")
 
@@ -28,9 +28,14 @@ AVATAR_IDENTITY = "visitor-avatar"
 PLAYER_IDENTITY = "player"
 SAMPLE_RATE = 24000
 MAX_DURATION_SECONDS = 6 * 60
+# Boson sometimes refuses a new avatar session right after the last one was released.
+AVATAR_ATTEMPTS = 3
+AVATAR_RETRY_SECONDS = 2
 # Silence that ends the player's turn. Higgs defaults to 500 ms; shorter replies faster but may cut
 # the player off mid-pause.
 SILENCE_MS = 300
+# Higher varies the wording more; 0.6 looped on the same sentence.
+TEMPERATURE = 0.8
 # The visitor's recent lines, fed back into its instructions so it stops repeating itself.
 RECENT_LINES = 6
 
@@ -40,6 +45,11 @@ PRESSURE_AT_INTERRUPTIONS = {2: 2, 3: 3}
 # before answering. Only replayed if it had spoken at least MIN_REPLAY_MS.
 REPLAY_PAUSE_MS = 700
 MIN_REPLAY_MS = 800
+# Once the door is decided: how long to wait for a cancelled reply to end, then for the last words to play.
+FINISH_REPLY_TIMEOUT = 5
+# A reply the server may have just triggered from the player's last words, before we hear about it.
+LATE_REPLY_MS = 300
+FAREWELL_TIMEOUT = 25
 
 
 def pressure_for(interruptions: int) -> int:
@@ -97,6 +107,14 @@ class Visitor:
         self._greeted = False
         self._player_stopped = None  # when the player last stopped talking, to measure reply latency
         self._said: list[str] = []
+        self._listening = True  # False once the door is decided: the player's mic stops reaching the model
+        self._active_response = None  # id of the response being generated
+        self._idle = asyncio.Event()  # no response being generated
+        self._idle.set()
+        self._decided = False  # from then on, only the farewell response is played
+        self._farewell_id = None
+        self._farewell_generated = False  # all its audio is with the avatar
+        self._farewell_heard = asyncio.Event()
 
     def player_token(self) -> str:
         return livekit_token(self.room_name, PLAYER_IDENTITY, publish=True, subscribe=True)
@@ -107,10 +125,11 @@ class Visitor:
 
     async def run(self):
         try:
-            await self._start_avatar()
+            # Join first, so a failure can still be reported to the player's page.
             await self._room.connect(
                 os.environ["LIVEKIT_URL"], livekit_token(self.room_name, AGENT_IDENTITY, publish=True, subscribe=True)
             )
+            await self._start_avatar()
             self._to_avatar = DataStreamAudioOutput(
                 self._room, destination_identity=AVATAR_IDENTITY, sample_rate=SAMPLE_RATE,
                 wait_remote_track=rtc.TrackKind.KIND_AUDIO,
@@ -124,7 +143,7 @@ class Visitor:
                     "session": {
                         "model": "higgs-realtime",
                         "instructions": self.character.instructions,
-                        "temperature": 0.6,
+                        "temperature": TEMPERATURE,
                         "audio": {
                             "input": {
                                 "turn_detection": {"type": "server_vad", "threshold": 0.85, "silence_duration_ms": SILENCE_MS},
@@ -174,10 +193,16 @@ class Visitor:
             "max_duration_seconds": MAX_DURATION_SECONDS,
         }
         async with aiohttp.ClientSession(headers=self._boson) as http:
-            async with http.post(f"{BOSON_BASE_URL}/avatar/sessions", json=body) as r:
-                if r.status >= 400:
-                    raise RuntimeError(f"avatar session failed: {r.status} {await r.text()}")
-                self._session_id = (await r.json())["id"]
+            for attempt in range(1, AVATAR_ATTEMPTS + 1):
+                async with http.post(f"{BOSON_BASE_URL}/avatar/sessions", json=body) as r:
+                    if r.status < 400:
+                        self._session_id = (await r.json())["id"]
+                        break
+                    error = f"avatar session failed: {r.status} {await r.text()}"
+                if attempt == AVATAR_ATTEMPTS:
+                    raise RuntimeError(error)
+                log.warning("%s; retrying", error)
+                await asyncio.sleep(AVATAR_RETRY_SECONDS)
         log.info("avatar %s in room %s (%s, %s)", self._session_id, self.room_name, self.character.key,
                  "IMPOSTOR" if self.is_impostor else "human")
 
@@ -198,6 +223,8 @@ class Visitor:
 
     async def _forward_player_audio(self, track):
         async for event in rtc.AudioStream(track, sample_rate=SAMPLE_RATE, num_channels=1):
+            if not self._listening:
+                continue
             try:
                 await self._send({"type": "input_audio_buffer.append",
                                   "audio": base64.b64encode(bytes(event.frame.data)).decode()})
@@ -206,6 +233,8 @@ class Visitor:
 
     def _on_playback_finished(self, ev):
         self._speaking = False
+        if self._farewell_generated:
+            self._farewell_heard.set()
         if ev.interrupted and self._item_id:
             # Make the stored conversation match what the player actually heard.
             asyncio.create_task(self._send({
@@ -232,7 +261,14 @@ class Visitor:
         async for message in self._ws:
             event = json.loads(message)
             kind = event["type"]
-            if kind == "response.output_audio.delta":
+            if kind == "response.created":
+                self._active_response = event["response"]["id"]
+                self._idle.clear()
+                if (event["response"].get("metadata") or {}).get("farewell"):
+                    self._farewell_id = event["response"]["id"]
+            elif kind == "response.output_audio.delta":
+                if self._decided and event.get("response_id") != self._farewell_id:
+                    continue
                 pcm = base64.b64decode(event["delta"])
                 if self._item_id != event["item_id"]:
                     if self._player_stopped:
@@ -249,6 +285,13 @@ class Visitor:
                 await self._play(pcm)
                 self._speaking = True
             elif kind == "response.done":
+                self._active_response = None
+                self._idle.set()
+                if self._decided:
+                    if event["response"]["id"] == self._farewell_id:
+                        self._to_avatar.flush()
+                        self._farewell_generated = True
+                    continue
                 self._to_avatar.flush()
                 await self._after_response()
             elif kind == "input_audio_buffer.speech_started":
@@ -268,15 +311,50 @@ class Visitor:
         # Only between responses: changing config mid-response can break the session.
         session = {"instructions": self.character.instructions + "\n\nWHAT YOU HAVE ALREADY SAID. Don't reuse "
                    "these lines or their phrases on your own; say something new. But if they ask you to repeat "
-                   "something or ask again (your name, where your bus broke down), answer it: the facts stay "
+                   "something or ask again (your name, what happened to you tonight), answer it: the facts stay "
                    "exactly the same, the words can differ.\n"
-                   + "\n".join(f"- {line}" for line in self._said[-RECENT_LINES:])}
+                   + "\n".join(f"- {line}" for line in self._recent_lines())}
         voice = voice_for(self.character, self.pressure)
         if voice != self._voice:
             self._voice = voice
             session["audio"] = {"output": {"voice": voice}}
             log.info("voice -> pressure %d", self.pressure)
         await self._send({"type": "session.update", "session": session})
+
+    def _recent_lines(self) -> list[str]:
+        # The opening plea too: it's the line they most like to fall back on.
+        return self._said[:1] + self._said[1:][-RECENT_LINES:]
+
+    async def decide(self, opened: bool):
+        """The player opened the door or kept it shut. The visitor stops listening and says its last words;
+        returns once they have played (or timed out)."""
+        if self.done.is_set() or self._ws is None:
+            return
+        self._listening = False
+        self._decided = True
+        self._replay = None
+        # Silence whatever they were saying, and end that audio segment: the avatar discards the rest of a
+        # cleared segment, so the last words have to start a new one.
+        self._to_avatar.clear_buffer()
+        self._to_avatar.flush()
+        try:
+            await self._send({"type": "input_audio_buffer.clear"})
+            await asyncio.sleep(LATE_REPLY_MS / 1000)
+            if self._active_response:
+                # Config can't change mid-response, and the thankful voice needs a session.update.
+                await self._send({"type": "response.cancel", "response_id": self._active_response})
+                await asyncio.wait_for(self._idle.wait(), FINISH_REPLY_TIMEOUT)
+            if opened and self.character.thankful_voice:
+                await self._send({"type": "session.update",
+                                  "session": {"audio": {"output": {"voice": self.character.thankful_voice}}}})
+            farewell = FAREWELL[(opened, self.is_impostor)]
+            # Stated before and after the character: per-response instructions are easy for it to ignore.
+            await self._send({"type": "response.create", "response": {
+                "metadata": {"farewell": "true"},
+                "instructions": f"{farewell}\n\n{self.character.instructions}\n\nNOW: {farewell}"}})
+            await asyncio.wait_for(self._farewell_heard.wait(), FAREWELL_TIMEOUT)
+        except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            log.warning("visitor's last words cut short")
 
     async def _send(self, event: dict):
         await self._ws.send(json.dumps(event))

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Knock Knock Imposter</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link href="https://fonts.googleapis.com/css2?family=Special+Elite&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Special+Elite&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -19,9 +19,13 @@
       <div class="handle"></div>
     </div>
     <div class="heat" aria-hidden="true"></div>
+    <div id="clock" class="clock hidden" role="timer" aria-label="Time left before dawn">3:00</div>
     <p id="status" class="status" role="status"></p>
+    <p id="reveal" class="reveal hidden" aria-live="polite"></p>
     <div class="controls">
-      <button id="leave" class="hidden">Step away from the door</button>
+      <button id="open" class="hidden">Unhook the chain</button>
+      <button id="shut" class="hidden">Keep it bolted</button>
+      <button id="next" class="hidden"></button>
     </div>
   </main>
 
@@ -32,9 +36,17 @@
       <li>Look through the peephole and <strong>talk to them</strong>. Interrupt whenever you like: they stop when you speak.</li>
       <li>Some visitors are human. Some only <em>sound</em> human. Push them, and the imitation slips.</li>
       <li>But push a real person too hard, and they start to sound wrong too.</li>
+      <li>Three visitors will knock tonight. You get <strong>three minutes</strong> with each. Then unhook the chain, or keep the door bolted. When time runs out, the door stays shut.</li>
+      <li>You survive only if <strong>more humans than impostors</strong> are inside with you at dawn.</li>
     </ul>
     <p class="hint">Use headphones. Allow the microphone.</p>
     <button id="start">Go to the door</button>
+  </section>
+
+  <section id="ending" class="intro hidden">
+    <h1 id="ending-title"></h1>
+    <p id="ending-text"></p>
+    <button id="again">Another night</button>
   </section>
 
   <script src="https://unpkg.com/livekit-client@2.15.0/dist/livekit-client.umd.js"></script>
