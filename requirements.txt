@@ -3,3 +3,4 @@ av==15.1.0  # last version with a wheel for macOS 13
 websockets
 requests
 certifi
+aiohttp
